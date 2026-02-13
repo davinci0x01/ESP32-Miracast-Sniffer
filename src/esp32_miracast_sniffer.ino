@@ -4,7 +4,7 @@
 
 // ===================== Branding =====================
 #define TOOL_NAME     "ESP32 Miracast Sniffer"
-#define TOOL_VERSION  "v1.0.0"
+#define TOOL_VERSION  "v2.0.0"
 #define TOOL_AUTHOR   "0xDaVinci (github.com/davinci0x01)"
 
 // ===================== Modes =====================
@@ -18,7 +18,6 @@ static Mode currentMode = MODE_SNIFF;
 // ===================== Sniffer DB =====================
 struct MacEntry {
   std::map<String, uint32_t> nameCounts; // name -> count
-  uint32_t hits = 0;                     // P2P/WPS seen
   int8_t lastRssi = 0;
   uint8_t lastCh = 0;
   uint32_t lastSeenMs = 0;
@@ -30,7 +29,7 @@ static std::map<String, MacEntry> db;
 static bool sniffEnabled = true;
 
 // Channels that worked well for you
-static int channels[] = {11, 1, 8, 10};
+static int channels[] = {11, 1, 6, 8, 10};
 static int chIdx = 0;
 
 static String lastSeenMac = "";
@@ -62,6 +61,14 @@ static String trimSpaces(String s) {
   while (end >= start && (s[end] == ' ' || s[end] == '\t')) end--;
   if (end < start) return "";
   return s.substring(start, end + 1);
+}
+
+static String normalizeMac(String s) {
+  s.trim();
+  s.toUpperCase();
+  s.replace("-", ":");
+  s.replace(" ", "");
+  return s;
 }
 
 static bool isBadName(const String &s) {
@@ -225,17 +232,21 @@ static void printReport() {
     const String &mac = it->first;
     MacEntry &e = it->second;
 
-    Serial.printf("MAC %s  hits=%u  lastCH=%u  lastRSSI=%d\n",
-                  mac.c_str(), (unsigned)e.hits, (unsigned)e.lastCh, (int)e.lastRssi);
+    Serial.printf("MAC: %s\n", mac.c_str());
+    Serial.printf("Last RSSI: %d\n", (int)e.lastRssi);
+    Serial.println("Names:");
 
     for (std::map<String, uint32_t>::iterator nm = e.nameCounts.begin(); nm != e.nameCounts.end(); ++nm) {
-      Serial.printf("  - %u  '%s'\n", (unsigned)nm->second, nm->first.c_str());
+      // Print name only (no counts)
+      Serial.printf("  - %s\n", nm->first.c_str());
     }
+
+    Serial.println("--------------------------------");
   }
 
   if (targetMac.length()) {
     Serial.print("TARGET MAC: ");
-    Serial.println(targetMac);
+    Serial.println(normalizeMac(targetMac));
   } else {
     Serial.println("TARGET MAC: (not set)  -> use: T <MAC>");
   }
@@ -273,7 +284,6 @@ static void sniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
   lastSeenMac = mac;
 
   MacEntry &e = db[mac];
-  e.hits++;
   e.lastRssi = rx.rssi;
   e.lastCh = rx.channel;
   e.lastSeenMs = millis();
@@ -348,12 +358,52 @@ static void startVerifyAPMode() {
   Serial.print("[VERIFY] AP IP: "); Serial.println(WiFi.softAPIP());
 
   if (!ok) Serial.println("[VERIFY] Failed to start AP!");
-  Serial.println("[VERIFY] Use command 'L' to list connected devices.");
+  Serial.println("[VERIFY] Type 'L' to show connected devices.");
   lastApListMs = 0;
+}
+
+// Convert MAC string to 6 bytes
+static bool parseMacToBytes(const String &macIn, uint8_t out[6]) {
+  String s = normalizeMac(macIn);
+
+  if (s.length() != 17) return false;
+
+  for (int i = 0; i < 6; i++) {
+    int pos = i * 3;
+
+    if (i < 5 && s[pos + 2] != ':') return false; // تأكد من وجود :
+
+    auto hexVal = [](char c) -> int {
+      if (c >= '0' && c <= '9') return c - '0';
+      if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+      return -1;
+    };
+
+    int h1 = hexVal(s[pos]);
+    int h2 = hexVal(s[pos + 1]);
+    if (h1 < 0 || h2 < 0) return false;
+
+    out[i] = (uint8_t)((h1 << 4) | h2);
+  }
+  return true;
+}
+
+// Count matching bytes between two MACs
+static int macByteMatches(const String &a, const String &b) {
+  uint8_t A[6], B[6];
+  if (!parseMacToBytes(a, A)) return -1;
+  if (!parseMacToBytes(b, B)) return -1;
+
+  int same = 0;
+  for (int i = 0; i < 6; i++) {
+    if (A[i] == B[i]) same++;
+  }
+  return same; // 0..6
 }
 
 // ===================== Verify: list stations =====================
 static void listStationsOnce() {
+
   if (currentMode != MODE_VERIFY_AP) {
     Serial.println("[ERR] Not in VERIFY mode. Use 'v' first.");
     return;
@@ -368,27 +418,56 @@ static void listStationsOnce() {
     return;
   }
 
-  Serial.printf("\n[VERIFY] Connected stations: %d\n", (int)sta_list.num);
+  Serial.println("\n========== VERIFY MODE ==========");
+  Serial.printf("Connected stations: %d\n", (int)sta_list.num);
+
+  if (targetMac.length()) {
+    Serial.print("Target MAC: ");
+    Serial.println(normalizeMac(targetMac));
+  } else {
+    Serial.println("Target MAC: (not set)  -> use: T <MAC>");
+  }
+
+  Serial.println("----------------------------------");
 
   for (int i = 0; i < sta_list.num; i++) {
+
     uint8_t *m = sta_list.sta[i].mac;
     char macStr[18];
     sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X",
             m[0], m[1], m[2], m[3], m[4], m[5]);
 
-    Serial.print(" - ");
-    Serial.print(macStr);
+    String staMac = String(macStr);
 
-    if (targetMac.length() && targetMac.equalsIgnoreCase(String(macStr))) {
-      Serial.println("   <-- MATCH ✅");
+    Serial.print(" - ");
+    Serial.print(staMac);
+
+    if (targetMac.length()) {
+
+      int same = macByteMatches(targetMac, staMac);
+
+      if (same == 6) {
+        Serial.println("   <-- MATCH ✅ (6/6)");
+      }
+      else if (same == 5) {
+        Serial.println("   <-- NEAR MATCH ⭐ (5/6)");
+      }
+      else if (same >= 4) {
+        Serial.printf("   <-- POSSIBLE ⚠️ (%d/6)\n", same);
+      }
+      else if (same >= 0) {
+        Serial.printf("   (%d/6)\n", same);
+      }
+      else {
+        Serial.println("   (MAC parse error)");
+      }
+
     } else {
       Serial.println();
     }
   }
 
-  if (!targetMac.length()) {
-    Serial.println("[VERIFY] TARGET MAC not set. Use: T <MAC>");
-  }
+  Serial.println("=================================\n");
 }
 
 // ===================== Serial Line Parser =====================
@@ -453,8 +532,7 @@ void loop() {
   if (currentMode == MODE_VERIFY_AP) {
     if (millis() - lastApListMs > 5000) {
       lastApListMs = millis();
-      // comment this out if you want manual listing only
-      listStationsOnce();
+      // listStationsOnce();   // uncomment this if you want auto listing
     }
   }
 
